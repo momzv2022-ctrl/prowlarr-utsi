@@ -42,6 +42,15 @@ services:
       - PROWLARR_APIKEY=${PROWLARR_API_KEY}
       - BRIDGE_HOST=0.0.0.0
       - BRIDGE_PORT=8788
+      # Speed knobs. Defaults match the bridge's own, so leaving these unset
+      # changes nothing; set them in .env when a search is slower than you want.
+      # A Prowlarr search waits for its slowest indexer, so the biggest lever by
+      # far is the first one: ask fewer indexers.
+      - PROWLARR_INDEXER_IDS=${PROWLARR_INDEXER_IDS:-}
+      - BRIDGE_TIMEOUT_S=${BRIDGE_TIMEOUT_S:-45}
+      - BRIDGE_MAX_ROWS=${BRIDGE_MAX_ROWS:-100}
+      - BRIDGE_BROWSE_ROWS=${BRIDGE_BROWSE_ROWS:-25}
+      - BRIDGE_MAX_RESOLVE=${BRIDGE_MAX_RESOLVE:-12}
     volumes:
       - ./bridge/worker.js:/app/worker.js:ro
     depends_on:

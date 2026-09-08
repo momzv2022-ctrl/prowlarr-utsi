@@ -55,6 +55,14 @@ else
   DOMAIN="${DOMAIN_GIVEN}"
 fi
 
+# Anything else already in .env — speed settings you have tuned, or an image
+# pinned by a rollback — is carried across. Rewriting only the keys this script
+# owns means re-running it never undoes your own edits.
+KEPT=""
+if [ -f .env ]; then
+  KEPT="$(grep -vE '^\s*(#|$)|^(DOMAIN|PROWLARR_API_KEY|BRIDGE_API_KEY|PROWLARR_USER|PROWLARR_PASSWORD)=' .env || true)"
+fi
+
 cat > .env <<ENV
 # Made by install.sh. Keep it: it is the only copy of your keys.
 DOMAIN=${DOMAIN}
@@ -62,7 +70,14 @@ PROWLARR_API_KEY=${PROWLARR_API_KEY}
 BRIDGE_API_KEY=${BRIDGE_API_KEY}
 PROWLARR_USER=${PROWLARR_USER}
 PROWLARR_PASSWORD=${PROWLARR_PASSWORD}
+
+# Speed. Unset means the default in the comment.
+#PROWLARR_INDEXER_IDS=      # only these indexer ids, comma separated. Empty = all
+#BRIDGE_MAX_ROWS=100        # rows asked of each indexer
+#BRIDGE_MAX_RESOLVE=12      # .torrent files read per page, for private trackers
+#BRIDGE_TIMEOUT_S=45        # how long to wait for Prowlarr
 ENV
+[ -z "$KEPT" ] || printf '\n%s\n' "$KEPT" >> .env
 chmod 600 .env
 
 # ---------------------------------------------------------------------------

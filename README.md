@@ -86,6 +86,51 @@ Which indexers get searched is whatever you have enabled in Prowlarr.
 `/healthz` needs no key and reports configuration. `/healthz?probe=1` needs the
 key and asks Prowlarr which of your indexers are currently failing.
 
+## When search is slow
+
+**A Prowlarr search waits for its slowest indexer.** It asks all of them at once
+and cannot answer until the last one has, so one unreachable indexer sets the
+pace for every query you make. Cloudflare-protected public indexers are the
+usual cause: they do not fail quickly, they time out.
+
+Find out which ones first, rather than guessing:
+
+```sh
+cd prowlarr-utsi && . ./.env
+curl -s -H "X-API-Key: $BRIDGE_API_KEY" \
+  "https://YOUR-ADDRESS/healthz?probe=1" | python3 -m json.tool
+```
+
+That names the indexers Prowlarr currently has blocked. Prowlarr's own
+*Indexers* page shows the same thing, and its log has per-indexer timings:
+
+```sh
+docker compose logs prowlarr | grep -iE "timeout|timed out|failed"
+```
+
+Then, in order of how much they help:
+
+1. **Turn off the indexers that are failing.** In Prowlarr, untick them. This is
+   almost always the entire fix, and it costs nothing — an indexer that times
+   out was contributing no results anyway.
+2. **Ask fewer indexers.** Set `PROWLARR_INDEXER_IDS=3,7` in `.env` to search
+   only those, keeping the rest available for anything else using Prowlarr.
+3. **Ask for fewer rows.** `BRIDGE_MAX_ROWS=40` instead of 100. Each indexer
+   returns less and answers sooner.
+4. **Read fewer `.torrent` files.** `BRIDGE_MAX_RESOLVE=6` instead of 12. This
+   only affects private trackers, where the bridge fetches the file to get an
+   infohash — good results, but a round trip each.
+5. **Fail sooner.** `BRIDGE_TIMEOUT_S=20` puts a firm ceiling on the wait. It
+   does not make anything faster; it stops you waiting on what will not answer.
+
+After editing `.env`:
+
+```sh
+docker compose up -d bridge
+```
+
+Your edits survive re-running `install.sh` — it only rewrites the keys it owns.
+
 ## What is running
 
 Three containers, and only one of them has a port open.
