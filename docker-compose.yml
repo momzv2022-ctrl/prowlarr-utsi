@@ -6,7 +6,9 @@
 
 services:
   prowlarr:
-    image: lscr.io/linuxserver/prowlarr:latest
+    # Overridable so update.sh can pin a known-good digest if an update
+    # breaks. Unset means the current release, which is what you want.
+    image: ${PROWLARR_IMAGE:-lscr.io/linuxserver/prowlarr:latest}
     container_name: prowlarr
     restart: unless-stopped
     environment:

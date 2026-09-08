@@ -109,18 +109,36 @@ published port and Caddy asks for a password first. If you edit
 
 ## Keeping it working
 
+**It updates itself, daily.** You do not have to do anything.
+
+That matters more here than for most things you install, because **Prowlarr
+ships its indexer definitions inside the release**. There is no separate "update
+indexers" step: when a tracker changes its site and somebody fixes the
+definition, that fix reaches you in the next Prowlarr image. A Prowlarr left
+pinned for a year is a Prowlarr whose indexers have quietly stopped working. So
+updating is not housekeeping — it *is* the maintenance.
+
+`install.sh` sets up a systemd timer (or a cron job) that runs `update.sh` once
+a day, at a random time so everyone is not pulling at midnight together. Each run:
+
+1. backs up `prowlarr/config` and keeps the last ten
+2. re-fetches the bridge and pulls newer images
+3. waits for Prowlarr to report healthy
+4. **and if it does not, puts the old version back** — pinning the previous
+   image in `.env`, restoring the config it just backed up, and starting again
+
+An unattended update that breaks and then stays broken would be worse than no
+unattended update at all, which is why step 4 exists.
+
 ```sh
-sudo bash install.sh
+bash update.sh                            # update now
+journalctl -u prowlarr-utsi-update        # how the last ones went
+NO_AUTOUPDATE=1 sudo bash install.sh      # set it up without the timer
 ```
 
-Run it again whenever. It keeps your keys, your password and your indexers, and
-pulls a newer Prowlarr and a newer bridge.
-
-Do that every month or so, because **Prowlarr ships its indexer definitions
-inside the release**. There is no separate "update indexers" step: when a
-tracker changes its site and the community fixes the definition, that fix
-reaches you in the next Prowlarr image. A Prowlarr left pinned for a year is a
-Prowlarr whose indexers have quietly stopped working.
+If a rollback happens you will find a `PROWLARR_IMAGE=` line pinned in `.env`.
+Updates stay on that version until you delete the line, so nothing keeps
+retrying a broken release behind your back.
 
 Your keys are in `.env`. Back up `prowlarr/config/` and you can rebuild the
 whole thing anywhere.

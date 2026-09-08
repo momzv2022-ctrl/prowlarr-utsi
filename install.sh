@@ -196,7 +196,55 @@ if command -v ufw >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Up
+# 8. Keep it up to date by itself
+# ---------------------------------------------------------------------------
+# Prowlarr's indexer definitions ship inside its image, so "update Prowlarr" and
+# "fix the indexers that broke this month" are the same action. Left alone, this
+# rots. update.sh backs up and rolls back on failure, so it is safe unattended.
+if [ "${NO_AUTOUPDATE:-}" = "1" ]; then
+  say "Automatic updates off (NO_AUTOUPDATE=1). Run bash update.sh yourself."
+elif command -v systemctl >/dev/null 2>&1; then
+  say "Setting up daily updates"
+  cat > /etc/systemd/system/prowlarr-utsi-update.service <<UNIT
+[Unit]
+Description=Update Prowlarr and the search bridge
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=${PWD}
+ExecStart=/usr/bin/env bash ${PWD}/update.sh
+UNIT
+
+  # Spread out across the day so everyone running this does not hit the
+  # registry at midnight together.
+  cat > /etc/systemd/system/prowlarr-utsi-update.timer <<UNIT
+[Unit]
+Description=Update Prowlarr and the search bridge daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable --now prowlarr-utsi-update.timer >/dev/null 2>&1 || true
+elif command -v crontab >/dev/null 2>&1; then
+  say "Setting up daily updates (cron)"
+  ( crontab -l 2>/dev/null | grep -v 'prowlarr-utsi update' || true
+    printf '%s\n' "$((RANDOM % 60)) 4 * * * cd ${PWD} && /usr/bin/env bash update.sh >> ${PWD}/update.log 2>&1 # prowlarr-utsi update"
+  ) | crontab -
+else
+  warn "No systemd or cron here, so updates are manual: bash update.sh"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Up
 # ---------------------------------------------------------------------------
 say "Starting"
 docker compose pull --quiet 2>/dev/null || docker compose pull
@@ -213,7 +261,7 @@ printf '\n'
 [ "${READY:-0}" = "1" ] || die "Prowlarr did not start. Look at: docker compose logs prowlarr"
 
 # ---------------------------------------------------------------------------
-# 9. Did the certificate actually arrive?
+# 10. Did the certificate actually arrive?
 # ---------------------------------------------------------------------------
 # Worth checking rather than assuming. Caddy keeps serving plain HTTP whatever
 # happens, so a silent failure here looks like a working install right up until
@@ -240,7 +288,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 10. What you came for
+# 11. What you came for
 # ---------------------------------------------------------------------------
 cat <<DONE
 
@@ -286,7 +334,9 @@ elif [ "$TLS" != "yes" ]; then
 fi
 
 cat <<'NOTE'
-  Keys are in .env. Update everything later with: bash install.sh
+  Keys are in .env. Prowlarr and the bridge update themselves daily;
+  run `bash update.sh` to do it now, or read update.log / journalctl
+  -u prowlarr-utsi-update to see how it went.
 
   Stopping: use `docker compose down`. Not `docker compose down -v` — that
   deletes the certificate along with everything else, and Let's Encrypt
