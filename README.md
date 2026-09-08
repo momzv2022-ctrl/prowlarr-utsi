@@ -16,10 +16,10 @@ It prints:
 
 ```
 ────────────────────────────────────────────────────────────────────
-  Search endpoint   http://203.0.113.10
+  Search endpoint   https://203-0-113-10.sslip.io
   Key               3f9a2c8e7b1d4056a9c3e5f7b2d81460
 
-  Prowlarr          http://203.0.113.10/prowlarr
+  Prowlarr          https://203-0-113-10.sslip.io/prowlarr
   Username          admin
   Password          8c41f7e29b
 ────────────────────────────────────────────────────────────────────
@@ -29,17 +29,46 @@ Open the Prowlarr link, add the indexers you want, and the endpoint searches
 them immediately. Nothing to restart and nothing to re-copy — the URL and the
 key never change.
 
-## With a domain
+## Where that name came from
 
-Point a domain at the server first, then:
+You need HTTPS whether you wanted it or not: **Android has refused plain HTTP by
+default since Android 9**, so a phone will not talk to an `http://` endpoint at
+all. A certificate needs a name, and a bare IP address cannot have one here.
+
+So if you do not give a name, one is made from your address.
+[sslip.io](https://sslip.io) is a public DNS service that resolves
+`203-0-113-10.sslip.io` to `203.0.113.10` — no account, no signup, nothing to
+configure. Caddy then gets a normal Let's Encrypt certificate for it.
+
+Two things to know about leaning on it:
+
+- **It is in the path forever.** Every request from your app resolves that name
+  through sslip.io. If that service is down, your endpoint is unreachable even
+  though your server is fine.
+- **First issuance can fail.** Its Let's Encrypt quota is shared by everyone
+  using it and occasionally runs dry. Renewals are exempt, so a working install
+  keeps working — this only ever bites a fresh one. `install.sh` checks whether
+  the certificate actually arrived and tells you what to do if it did not.
+
+Neither matters much for trying this out. Both are reasons to use your own name
+once you care.
+
+## With your own domain
+
+Point a domain or subdomain at the server, then:
 
 ```sh
 DOMAIN=search.example.com sudo bash install.sh
 ```
 
-You get a real certificate, automatically, and everything moves to `https://`.
-Without a domain it is plain HTTP, so the password and the key cross the network
-in the clear — fine on a private network, not fine on the open internet.
+Same one command, no third-party DNS in the path. This is the better setup and
+the only difference is that you had to own a name.
+
+To skip certificates altogether — a private network, say:
+
+```sh
+NO_TLS=1 sudo bash install.sh
+```
 
 ## What your app gets
 
@@ -101,6 +130,11 @@ docker compose logs -f       # what is it doing
 docker compose restart       # turn it off and on again
 docker compose down          # stop everything
 ```
+
+**Not `docker compose down -v`.** That deletes the volume holding your
+certificate, and Let's Encrypt issues at most five per name per week — wipe it a
+few times while debugging and you are locked out of your own address for a day
+at a time, with a perfectly healthy server.
 
 ## Requirements
 

@@ -2,8 +2,9 @@
 #
 # Prowlarr + search endpoint, on a fresh server, in one command.
 #
-#   bash install.sh                 → plain HTTP on this server's IP
-#   DOMAIN=search.example.com bash install.sh   → HTTPS, certificate and all
+#   bash install.sh                           → HTTPS on a name made from your IP
+#   DOMAIN=search.example.com bash install.sh  → HTTPS on your own name
+#   NO_TLS=1 bash install.sh                   → plain HTTP, no certificate
 #
 # Run it again any time: it keeps your keys and your indexers, and picks up a
 # newer Prowlarr and a newer bridge.
@@ -16,6 +17,7 @@ DOMAIN_GIVEN="${DOMAIN:-}"
 BRIDGE_SOURCE="https://raw.githubusercontent.com/momzv2022-ctrl/prowlarr-bridge/main/worker/src/worker.js"
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*"; }
 die() { printf '\n\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Run this as root: sudo bash install.sh"
@@ -40,30 +42,22 @@ if [ -f .env ]; then
   say "Keeping the keys already in .env"
   # shellcheck disable=SC1091
   . ./.env
+  # A domain on the command line beats the one remembered here, so it can be
+  # changed. Only an explicitly given domain is ever stored: the one derived
+  # from your IP is worked out afresh each run, so moving server just works.
   DOMAIN="${DOMAIN_GIVEN:-${DOMAIN:-}}"
 else
-  DOMAIN="${DOMAIN_GIVEN}"
   say "Making your keys"
   PROWLARR_API_KEY="$(rand 16)"
   BRIDGE_API_KEY="$(rand 16)"
   PROWLARR_USER="admin"
   PROWLARR_PASSWORD="$(rand 9)"
-fi
-
-# The address Caddy answers on. A domain gets a real certificate; without one
-# there is nothing to put a certificate on, so it is plain HTTP.
-if [ -n "$DOMAIN" ]; then
-  SITE_ADDRESS="$DOMAIN"
-  PUBLIC_URL="https://$DOMAIN"
-else
-  SITE_ADDRESS=":80"
-  PUBLIC_URL="http://$(curl -fsS --max-time 10 https://api.ipify.org || echo 'YOUR-SERVER-IP')"
+  DOMAIN="${DOMAIN_GIVEN}"
 fi
 
 cat > .env <<ENV
 # Made by install.sh. Keep it: it is the only copy of your keys.
 DOMAIN=${DOMAIN}
-SITE_ADDRESS=${SITE_ADDRESS}
 PROWLARR_API_KEY=${PROWLARR_API_KEY}
 BRIDGE_API_KEY=${BRIDGE_API_KEY}
 PROWLARR_USER=${PROWLARR_USER}
@@ -72,7 +66,31 @@ ENV
 chmod 600 .env
 
 # ---------------------------------------------------------------------------
-# 3. Caddy's config
+# 3. What name to answer on
+# ---------------------------------------------------------------------------
+# A phone will not talk to a plain-HTTP endpoint — Android has refused cleartext
+# by default since Android 9 — so a certificate is not a nicety here, it is the
+# difference between working and not. A certificate needs a name, and a bare IP
+# cannot get one from Let's Encrypt through Caddy today.
+#
+# So when you have not given a name, one is made from your address: sslip.io
+# resolves 1-2-3-4.sslip.io to 1.2.3.4, with no account and no signup. It costs
+# one dependency worth knowing about — see README.
+PUBLIC_IP="$(curl -fsS --max-time 10 https://api.ipify.org || echo '')"
+
+if [ -n "$DOMAIN" ]; then
+  HOST="$DOMAIN"; TLS=yes
+elif [ "${NO_TLS:-}" = "1" ]; then
+  HOST=""; TLS=no
+elif [ -n "$PUBLIC_IP" ]; then
+  HOST="$(echo "$PUBLIC_IP" | tr '.' '-').sslip.io"; TLS=yes
+else
+  warn "Could not work out this server's public address; staying on plain HTTP."
+  HOST=""; TLS=no
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Caddy's config
 # ---------------------------------------------------------------------------
 # Written here rather than shipped, because the password hash belongs in it and
 # a bcrypt hash is full of `$` — which compose would read as variables.
@@ -80,35 +98,64 @@ say "Configuring the front door"
 PROWLARR_PASSWORD_HASH="$(docker run --rm caddy:2-alpine \
   caddy hash-password --plaintext "$PROWLARR_PASSWORD")"
 
-cat > caddy/Caddyfile <<CADDY
-${SITE_ADDRESS} {
+{
+  cat <<CADDY
+(bridge_routes) {
+	# The search endpoint. No password: it carries its own key, and an app
+	# cannot send a browser login.
+	handle {
+		reverse_proxy bridge:8788
+	}
+	encode gzip
+}
+
+CADDY
+
+  if [ "$TLS" = "yes" ]; then
+    cat <<CADDY
+${HOST} {
 	# Prowlarr's own interface, behind a password. Prowlarr is set to
-	# \`External\` auth, which means it does no checking of its own and trusts
-	# whatever reaches it — so this block is the only thing standing in front
-	# of it. Do not remove it.
+	# \`External\` auth, which means it does no checking of its own and
+	# trusts whatever reaches it — so this block is the only thing standing
+	# in front of it. Do not remove it.
 	handle /prowlarr* {
 		basic_auth {
 			${PROWLARR_USER} ${PROWLARR_PASSWORD_HASH}
 		}
 		reverse_proxy prowlarr:9696
 	}
+	import bridge_routes
+}
 
-	# The search endpoint. No password here: it carries its own key, and an
-	# app cannot send a browser login.
-	handle {
-		reverse_proxy bridge:8788
-	}
-
-	encode gzip
-	log {
-		output file /var/log/caddy/access.log
-		format console
-	}
+# Plain HTTP, reachable by IP, so a client that cannot do TLS still has a way in
+# and a failed certificate does not leave you with nothing. Prowlarr is
+# deliberately absent here: its password must never cross an unencrypted link.
+http:// {
+	import bridge_routes
 }
 CADDY
+  else
+    cat <<CADDY
+:80 {
+	handle /prowlarr* {
+		basic_auth {
+			${PROWLARR_USER} ${PROWLARR_PASSWORD_HASH}
+		}
+		reverse_proxy prowlarr:9696
+	}
+	import bridge_routes
+}
+CADDY
+  fi
+} > caddy/Caddyfile
+
+# A broken Caddyfile takes the whole thing down, so check it before starting.
+docker run --rm -v "$PWD/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2-alpine \
+  caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
+  || die "The generated caddy/Caddyfile is not valid. Please open an issue with it attached."
 
 # ---------------------------------------------------------------------------
-# 4. Prowlarr's config, written before its first start
+# 5. Prowlarr's config, written before its first start
 # ---------------------------------------------------------------------------
 # Writing this now rather than clicking through the setup wizard is what makes
 # the install one command. It also means Prowlarr never exists in an
@@ -132,13 +179,13 @@ XML
 fi
 
 # ---------------------------------------------------------------------------
-# 5. The bridge — one file, no dependencies
+# 6. The bridge — one file, no dependencies
 # ---------------------------------------------------------------------------
 say "Fetching the bridge"
 curl -fsSL -o bridge/worker.js "$BRIDGE_SOURCE" || die "Could not fetch the bridge from $BRIDGE_SOURCE"
 
 # ---------------------------------------------------------------------------
-# 6. Firewall, if this box has one
+# 7. Firewall, if this box has one
 # ---------------------------------------------------------------------------
 if command -v ufw >/dev/null 2>&1; then
   say "Opening 80 and 443, and nothing else"
@@ -149,7 +196,7 @@ if command -v ufw >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Up
+# 8. Up
 # ---------------------------------------------------------------------------
 say "Starting"
 docker compose pull --quiet 2>/dev/null || docker compose pull
@@ -166,7 +213,34 @@ printf '\n'
 [ "${READY:-0}" = "1" ] || die "Prowlarr did not start. Look at: docker compose logs prowlarr"
 
 # ---------------------------------------------------------------------------
-# 8. What you came for
+# 9. Did the certificate actually arrive?
+# ---------------------------------------------------------------------------
+# Worth checking rather than assuming. Caddy keeps serving plain HTTP whatever
+# happens, so a silent failure here looks like a working install right up until
+# the app says it cannot connect.
+CERT_OK=0
+if [ "$TLS" = "yes" ]; then
+  printf '  getting a certificate for %s' "$HOST"
+  for _ in $(seq 1 45); do
+    # --resolve sends the right name to our own Caddy, without depending on
+    # this server being able to reach its own public address.
+    if curl -sS --max-time 8 --resolve "${HOST}:443:127.0.0.1" \
+        -o /dev/null "https://${HOST}/healthz" 2>/dev/null; then
+      CERT_OK=1; break
+    fi
+    printf '.'; sleep 4
+  done
+  printf '\n'
+fi
+
+if [ "$TLS" = "yes" ] && [ "$CERT_OK" = "1" ]; then
+  PUBLIC_URL="https://${HOST}"
+else
+  PUBLIC_URL="http://${PUBLIC_IP:-YOUR-SERVER-IP}"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. What you came for
 # ---------------------------------------------------------------------------
 cat <<DONE
 
@@ -189,14 +263,34 @@ cat <<DONE
 
 DONE
 
-if [ -z "$DOMAIN" ]; then
-  cat <<'WARN'
-  ⚠  This is plain HTTP, so that password and that key cross the
-     network in the clear. Point a domain at this server and run
-     again with DOMAIN=search.example.com for a real certificate.
-
-WARN
+if [ "$TLS" = "yes" ] && [ "$CERT_OK" != "1" ]; then
+  warn "  ⚠  No certificate arrived for ${HOST}, so this is plain HTTP."
+  echo "     Phones will refuse it: Android blocks cleartext by default."
+  echo
+  echo "     Usually one of:"
+  echo "       • port 80 is not reachable from the internet — check your"
+  echo "         provider's firewall as well as this server's"
+  echo "       • ${HOST} does not resolve here yet"
+  echo "       • sslip.io's weekly certificate quota is used up, which"
+  echo "         happens occasionally and is shared by everyone using it"
+  echo
+  echo "     What Caddy thought:   docker compose logs caddy | grep -i acme"
+  echo "     Try again:            bash install.sh"
+  echo "     Or use your own name: DOMAIN=search.example.com bash install.sh"
+  echo
+elif [ "$TLS" != "yes" ]; then
+  warn "  ⚠  Plain HTTP, so that password and that key cross the network in"
+  echo "     the clear, and phones will refuse it outright."
+  echo "     Re-run without NO_TLS=1 to get a certificate automatically."
+  echo
 fi
 
-echo "  Keys are in .env. Update everything later with: bash install.sh"
-echo
+cat <<'NOTE'
+  Keys are in .env. Update everything later with: bash install.sh
+
+  Stopping: use `docker compose down`. Not `docker compose down -v` — that
+  deletes the certificate along with everything else, and Let's Encrypt
+  allows only five per name per week, so repeated wipes lock you out of
+  your own address for a day at a time.
+
+NOTE
