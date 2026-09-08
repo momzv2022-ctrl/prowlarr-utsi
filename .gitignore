@@ -1,0 +1,6 @@
+# Made by install.sh, and yours alone.
+.env
+caddy/Caddyfile
+caddy/logs/
+prowlarr/
+bridge/worker.js

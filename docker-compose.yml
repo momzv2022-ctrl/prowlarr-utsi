@@ -1,0 +1,74 @@
+# Three containers: Prowlarr, the bridge, and Caddy in front of both.
+#
+# Only Caddy publishes a port. Prowlarr and the bridge are reachable on the
+# private network between them and nowhere else, which is why Prowlarr can be
+# set to `External` auth without being open to the world.
+
+services:
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./prowlarr/config:/config
+    # Deliberately no `ports:`. Prowlarr is for Caddy and the bridge to reach,
+    # not the internet. Adding one here would expose an instance that does no
+    # authentication of its own.
+    networks: [inside]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9696/prowlarr/ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  bridge:
+    image: node:20-alpine
+    container_name: bridge
+    restart: unless-stopped
+    working_dir: /app
+    command: node worker.js
+    environment:
+      # What your app sends here.
+      - BRIDGE_API_KEY=${BRIDGE_API_KEY}
+      # What this sends to Prowlarr. It never travels back to a client.
+      - PROWLARR_URL=http://prowlarr:9696/prowlarr
+      - PROWLARR_APIKEY=${PROWLARR_API_KEY}
+      - BRIDGE_HOST=0.0.0.0
+      - BRIDGE_PORT=8788
+    volumes:
+      - ./bridge/worker.js:/app/worker.js:ro
+    depends_on:
+      prowlarr:
+        condition: service_healthy
+    networks: [inside]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - ./caddy/logs:/var/log/caddy
+    depends_on: [prowlarr, bridge]
+    networks: [inside]
+
+networks:
+  inside:
+    driver: bridge
+
+volumes:
+  # Certificates live here. Losing this means Let's Encrypt has to issue again,
+  # and there is a rate limit on that, so leave it alone.
+  caddy_data:
+  caddy_config:
