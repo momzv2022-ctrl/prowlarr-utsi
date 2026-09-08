@@ -197,7 +197,20 @@ fi
 # 6. The bridge — one file, no dependencies
 # ---------------------------------------------------------------------------
 say "Fetching the bridge"
-curl -fsSL -o bridge/worker.js "$BRIDGE_SOURCE" || die "Could not fetch the bridge from $BRIDGE_SOURCE"
+# To a temporary file first: a failed download must not truncate the copy that
+# works. Then written INTO the existing file rather than moved over it, because
+# Docker binds a single-file mount to the inode and would not follow a move.
+curl -fsSL -o bridge/worker.js.new "$BRIDGE_SOURCE" \
+  || die "Could not fetch the bridge from $BRIDGE_SOURCE"
+if [ ! -s bridge/worker.js.new ] || [ "$(wc -c < bridge/worker.js.new)" -lt 40000 ] \
+   || ! grep -q 'Prowlarr bridge' bridge/worker.js.new; then
+  rm -f bridge/worker.js.new
+  [ -s bridge/worker.js ] || die "What came back from $BRIDGE_SOURCE is not the bridge."
+  warn "What came back does not look like the bridge; keeping the copy that works."
+else
+  cat bridge/worker.js.new > bridge/worker.js
+  rm -f bridge/worker.js.new
+fi
 
 # ---------------------------------------------------------------------------
 # 7. Firewall, if this box has one
@@ -264,6 +277,10 @@ fi
 say "Starting"
 docker compose pull --quiet 2>/dev/null || docker compose pull
 docker compose up -d
+# node read worker.js at startup and compose will not recreate the container
+# just because a mounted file changed, so a re-run would otherwise keep serving
+# whichever bridge happened to be running.
+docker compose up -d --force-recreate --no-deps bridge >/dev/null 2>&1 || true
 
 printf '  waiting for Prowlarr'
 for _ in $(seq 1 90); do

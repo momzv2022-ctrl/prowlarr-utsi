@@ -22,6 +22,13 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
+# Is this actually the bridge, and not an error page or half a download?
+bridge_sane() {
+  [ -s "$1" ] || return 1
+  [ "$(wc -c < "$1")" -gt 40000 ] || return 1
+  grep -q 'Prowlarr bridge' "$1" || return 1
+}
+
 [ -f .env ] || { log "no .env here — run install.sh first"; exit 1; }
 
 mkdir -p "$BACKUPS"
@@ -50,9 +57,17 @@ ls -1t "${BACKUPS}"/config-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs
 # 2. The bridge is one file, so updating it is fetching it
 # ---------------------------------------------------------------------------
 if curl -fsSL --max-time 30 -o bridge/worker.js.new "$BRIDGE_SOURCE"; then
-  if ! cmp -s bridge/worker.js.new bridge/worker.js 2>/dev/null; then
+  if ! bridge_sane bridge/worker.js.new; then
+    rm -f bridge/worker.js.new
+    log "what came back does not look like the bridge; keeping the copy that works"
+  elif ! cmp -s bridge/worker.js.new bridge/worker.js 2>/dev/null; then
     cp bridge/worker.js "${BACKUPS}/worker-${STAMP}.js" 2>/dev/null || true
-    mv bridge/worker.js.new bridge/worker.js
+    # Written INTO the existing file rather than moved over it. Docker binds a
+    # single-file mount to the inode, so `mv` would give the container a file
+    # the host can no longer see it through, and it would keep serving the old
+    # one forever.
+    cat bridge/worker.js.new > bridge/worker.js
+    rm -f bridge/worker.js.new
     BRIDGE_CHANGED=1
     log "bridge updated"
   else
@@ -74,6 +89,14 @@ docker compose pull --quiet 2>/dev/null || docker compose pull || \
 # rollback below exists for. Letting `set -e` kill the script here would mean
 # the rollback never ran on the one occasion it is needed.
 docker compose up -d || log "compose up reported a problem; checking health anyway"
+
+# `node` read worker.js when it started and will not read it again, and compose
+# does not recreate a container just because a mounted file changed. Without
+# this the bridge reports itself updated and goes on running the old code.
+if [ -n "${BRIDGE_CHANGED:-}" ]; then
+  docker compose up -d --force-recreate --no-deps bridge \
+    || log "could not restart the bridge"
+fi
 
 NEW_IMAGE="$(image_digest prowlarr)"
 if [ "$OLD_IMAGE" = "$NEW_IMAGE" ] && [ -z "${BRIDGE_CHANGED:-}" ]; then
