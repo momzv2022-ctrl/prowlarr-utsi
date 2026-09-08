@@ -22,6 +22,16 @@ die() { printf '\n\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Run this as root: sudo bash install.sh"
 
+# A timer runs update.sh as root every day. If this directory belongs to an
+# ordinary user — which it does when you `git clone` before `sudo bash` — then
+# that user can rewrite what root is about to execute. Take ownership.
+if [ "$(stat -c %u . 2>/dev/null || echo 0)" != "0" ]; then
+  say "Taking ownership of this directory, since root runs update.sh from it"
+  chown -R root:root .
+  chmod -R go-w .
+  echo "  (use sudo git pull here from now on)"
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Docker
 # ---------------------------------------------------------------------------
@@ -48,11 +58,57 @@ if [ -f .env ]; then
   DOMAIN="${DOMAIN_GIVEN:-${DOMAIN:-}}"
 else
   say "Making your keys"
-  PROWLARR_API_KEY="$(rand 16)"
+  # If Prowlarr already exists, its key is the one that counts — minting a new
+  # one here would leave the bridge holding a key Prowlarr has never heard of,
+  # and every search would come back 401 for no visible reason.
+  # `|| true` matters: with pipefail, sed failing on a missing config.xml would
+  # take the whole pipeline's status, and set -e would end the script here.
+  PROWLARR_API_KEY="$(sed -n 's:.*<ApiKey>\(.*\)</ApiKey>.*:\1:p' \
+    prowlarr/config/config.xml 2>/dev/null | head -1 || true)"
+  if [ -n "$PROWLARR_API_KEY" ]; then
+    echo "  adopting the API key Prowlarr already has"
+  else
+    PROWLARR_API_KEY="$(rand 16)"
+  fi
   BRIDGE_API_KEY="$(rand 16)"
   PROWLARR_USER="admin"
   PROWLARR_PASSWORD="$(rand 9)"
   DOMAIN="${DOMAIN_GIVEN}"
+fi
+
+
+# ---------------------------------------------------------------------------
+# 3. What name to answer on, and the file that remembers it
+# ---------------------------------------------------------------------------
+# A phone will not talk to a plain-HTTP endpoint — Android has refused cleartext
+# by default since Android 9 — so a certificate is not a nicety here, it is the
+# difference between working and not. A certificate needs a name, and a bare IP
+# cannot get one from Let's Encrypt through Caddy today.
+#
+# So when you have not given a name, one is made from your address: sslip.io
+# resolves 1-2-3-4.sslip.io to 1.2.3.4, with no account and no signup. It costs
+# one dependency worth knowing about — see README.
+PUBLIC_IP="$(curl -fsS --max-time 10 https://api.ipify.org \
+  || curl -fsS --max-time 10 https://ifconfig.me/ip \
+  || echo '')"
+PUBLIC_IP="$(printf '%s' "$PUBLIC_IP" | tr -dc '0-9.')"
+
+# NO_TLS is checked FIRST so it still works on a box that has a DOMAIN stored.
+if [ "${NO_TLS:-}" = "1" ]; then
+  HOST=""; TLS=no
+elif [ -n "$DOMAIN" ]; then
+  HOST="$DOMAIN"; TLS=yes
+elif [ -n "$PUBLIC_IP" ]; then
+  HOST="$(echo "$PUBLIC_IP" | tr '.' '-').sslip.io"; TLS=yes
+elif [ -n "${LAST_HOST:-}" ]; then
+  # Both address lookups failed. Falling back to plain HTTP here would put
+  # Prowlarr's admin page — password and all — on an unencrypted port, so keep
+  # the name that already works instead.
+  warn "Could not look up this server's address; keeping ${LAST_HOST}."
+  HOST="$LAST_HOST"; TLS=yes
+else
+  warn "Could not work out this server's public address; staying on plain HTTP."
+  HOST=""; TLS=no
 fi
 
 # Anything else already in .env — speed settings you have tuned, or an image
@@ -60,7 +116,7 @@ fi
 # owns means re-running it never undoes your own edits.
 KEPT=""
 if [ -f .env ]; then
-  KEPT="$(grep -vE '^\s*(#|$)|^(DOMAIN|PROWLARR_API_KEY|BRIDGE_API_KEY|PROWLARR_USER|PROWLARR_PASSWORD)=' .env || true)"
+  KEPT="$(grep -vE '^\s*(#|$)|^(DOMAIN|LAST_HOST|PROWLARR_API_KEY|BRIDGE_API_KEY|PROWLARR_USER|PROWLARR_PASSWORD)=' .env || true)"
 fi
 
 cat > .env <<ENV
@@ -70,6 +126,7 @@ PROWLARR_API_KEY=${PROWLARR_API_KEY}
 BRIDGE_API_KEY=${BRIDGE_API_KEY}
 PROWLARR_USER=${PROWLARR_USER}
 PROWLARR_PASSWORD=${PROWLARR_PASSWORD}
+LAST_HOST=${HOST}
 
 # Speed. Unset means the default in the comment.
 #PROWLARR_INDEXER_IDS=      # only these indexer ids, comma separated. Empty = all
@@ -81,37 +138,18 @@ ENV
 chmod 600 .env
 
 # ---------------------------------------------------------------------------
-# 3. What name to answer on
-# ---------------------------------------------------------------------------
-# A phone will not talk to a plain-HTTP endpoint — Android has refused cleartext
-# by default since Android 9 — so a certificate is not a nicety here, it is the
-# difference between working and not. A certificate needs a name, and a bare IP
-# cannot get one from Let's Encrypt through Caddy today.
-#
-# So when you have not given a name, one is made from your address: sslip.io
-# resolves 1-2-3-4.sslip.io to 1.2.3.4, with no account and no signup. It costs
-# one dependency worth knowing about — see README.
-PUBLIC_IP="$(curl -fsS --max-time 10 https://api.ipify.org || echo '')"
-
-if [ -n "$DOMAIN" ]; then
-  HOST="$DOMAIN"; TLS=yes
-elif [ "${NO_TLS:-}" = "1" ]; then
-  HOST=""; TLS=no
-elif [ -n "$PUBLIC_IP" ]; then
-  HOST="$(echo "$PUBLIC_IP" | tr '.' '-').sslip.io"; TLS=yes
-else
-  warn "Could not work out this server's public address; staying on plain HTTP."
-  HOST=""; TLS=no
-fi
-
-# ---------------------------------------------------------------------------
 # 4. Caddy's config
 # ---------------------------------------------------------------------------
 # Written here rather than shipped, because the password hash belongs in it and
 # a bcrypt hash is full of `$` — which compose would read as variables.
 say "Configuring the front door"
-PROWLARR_PASSWORD_HASH="$(docker run --rm caddy:2-alpine \
-  caddy hash-password --plaintext "$PROWLARR_PASSWORD")"
+# Fed on stdin, not as an argument: an argument is visible to anyone who runs
+# `ps` on this box for as long as the command lasts.
+# The trailing newline matters: without it caddy sits waiting for the rest of
+# the line and gives up with "Error: EOF".
+PROWLARR_PASSWORD_HASH="$(printf '%s\n' "$PROWLARR_PASSWORD" \
+  | docker run --rm -i caddy:2-alpine caddy hash-password)"
+[ -n "$PROWLARR_PASSWORD_HASH" ] || die "Could not hash the Prowlarr password."
 
 {
   cat <<CADDY
@@ -215,12 +253,17 @@ fi
 # ---------------------------------------------------------------------------
 # 7. Firewall, if this box has one
 # ---------------------------------------------------------------------------
-if command -v ufw >/dev/null 2>&1; then
-  say "Opening 80 and 443, and nothing else"
-  ufw allow 22/tcp >/dev/null 2>&1 || true
-  ufw allow 80/tcp >/dev/null 2>&1 || true
-  ufw allow 443/tcp >/dev/null 2>&1 || true
-  ufw --force enable >/dev/null 2>&1 || true
+# Rules are added only to a firewall that is ALREADY on. Turning ufw on here
+# would apply its default deny-incoming with only these rules — and if sshd
+# listens anywhere but 22, which is a common hardening step, that locks you out
+# of your own server with no way back in.
+if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+  say "Adding ufw rules for 80 and 443"
+  ufw allow 80/tcp >/dev/null || warn "could not add the ufw rule for 80"
+  ufw allow 443/tcp >/dev/null || warn "could not add the ufw rule for 443"
+elif command -v ufw >/dev/null 2>&1; then
+  echo "  ufw is installed but not active; leaving it alone."
+  echo "  If you turn it on, allow 80 and 443 — and your SSH port."
 fi
 
 # ---------------------------------------------------------------------------
@@ -281,6 +324,15 @@ docker compose up -d
 # just because a mounted file changed, so a re-run would otherwise keep serving
 # whichever bridge happened to be running.
 docker compose up -d --force-recreate --no-deps bridge >/dev/null 2>&1 || true
+
+# Caddy parses its config once, at start, and compose will not recreate the
+# container just because a mounted file changed — so without this a re-run that
+# changed DOMAIN or NO_TLS would write a correct Caddyfile that Caddy never
+# reads, then spend nine minutes failing to find a certificate for a site it
+# was never told about. Reloading in place keeps the certificate store.
+docker compose exec -T caddy caddy reload --adapter caddyfile --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
+  || docker compose up -d --force-recreate --no-deps caddy >/dev/null 2>&1 \
+  || warn "Could not reload Caddy; run: docker compose up -d --force-recreate --no-deps caddy"
 
 printf '  waiting for Prowlarr'
 for _ in $(seq 1 90); do

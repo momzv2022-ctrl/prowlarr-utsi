@@ -53,9 +53,12 @@ services:
       - BRIDGE_MAX_RESOLVE=${BRIDGE_MAX_RESOLVE:-12}
     volumes:
       - ./bridge/worker.js:/app/worker.js:ro
-    depends_on:
-      prowlarr:
-        condition: service_healthy
+    # Ordering only, deliberately NOT `condition: service_healthy`. The bridge
+    # dials Prowlarr per request and reports the failure through /healthz, so it
+    # has no reason to refuse to start — and gating on health here would stop
+    # Caddy starting too, leaving 80 and 443 unbound and the certificate
+    # unrenewable while Prowlarr was unwell.
+    depends_on: [prowlarr]
     networks: [inside]
 
   caddy:

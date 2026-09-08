@@ -32,6 +32,7 @@ bridge_sane() {
 [ -f .env ] || { log "no .env here — run install.sh first"; exit 1; }
 
 mkdir -p "$BACKUPS"
+chmod 700 "$BACKUPS"   # every tracker credential Prowlarr holds is in here
 
 # ---------------------------------------------------------------------------
 # 1. Remember what works, so there is something to go back to
@@ -48,8 +49,23 @@ image_digest() {
 OLD_IMAGE="$(image_digest prowlarr)"
 log "currently running ${OLD_IMAGE:-unknown}"
 
-tar czf "${BACKUPS}/config-${STAMP}.tar.gz" prowlarr/config
-log "backed up config to ${BACKUPS}/config-${STAMP}.tar.gz"
+# Prowlarr is stopped for this. Its config is a live SQLite database with a
+# write-ahead log; tarring it while it runs can capture the .db and the .db-wal
+# from different moments, and the archive the rollback depends on would then be
+# one Prowlarr refuses to open. A few seconds down beats an unrestorable backup.
+BACKUP="${BACKUPS}/config-${STAMP}.tar.gz"
+docker compose stop prowlarr >/dev/null 2>&1 || true
+if tar czf "$BACKUP" prowlarr/config; then
+  docker compose start prowlarr >/dev/null 2>&1 || true
+  log "backed up config to ${BACKUP}"
+else
+  # Always bring it back up, then stop: without a good backup the rollback
+  # below has nothing to restore, so there is no safe way to continue.
+  rm -f "$BACKUP"
+  docker compose start prowlarr >/dev/null 2>&1 || true
+  log "ERROR: could not back up the config, so not updating. Check disk space."
+  exit 1
+fi
 # shellcheck disable=SC2012
 ls -1t "${BACKUPS}"/config-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm --
 
@@ -116,7 +132,22 @@ for _ in $(seq 1 90); do
   sleep 2
 done
 
+# Prowlarr being well says nothing about the bridge, which is the thing clients
+# actually talk to — and it is the half this script just replaced.
+BRIDGE_OK=0
 if [ "$HEALTHY" = "1" ]; then
+  for _ in $(seq 1 15); do
+    if docker compose exec -T bridge wget -qO- http://127.0.0.1:8788/healthz >/dev/null 2>&1 \
+       || docker compose exec -T bridge node -e \
+            'fetch("http://127.0.0.1:8788/healthz").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' >/dev/null 2>&1; then
+      BRIDGE_OK=1; break
+    fi
+    sleep 2
+  done
+  [ "$BRIDGE_OK" = "1" ] || log "ERROR: the bridge is not answering after the update"
+fi
+
+if [ "$HEALTHY" = "1" ] && [ "$BRIDGE_OK" = "1" ]; then
   log "update ok"
   docker image prune -f >/dev/null 2>&1 || true
   exit 0
@@ -128,6 +159,17 @@ fi
 # An unattended update that breaks and then stays broken is worse than no
 # unattended update at all, so this is the part that earns the whole script.
 log "ERROR: Prowlarr did not come back healthy — rolling back"
+
+roll_back_bridge() {
+  # The bridge is updated by replacing a mounted file, so putting it back means
+  # putting the old bytes back and recreating the container.
+  if [ -n "${BRIDGE_CHANGED:-}" ] && [ -s "${BACKUPS}/worker-${STAMP}.js" ]; then
+    cat "${BACKUPS}/worker-${STAMP}.js" > bridge/worker.js
+    docker compose up -d --force-recreate --no-deps bridge >/dev/null 2>&1 || true
+    log "put the previous bridge back"
+  fi
+}
+roll_back_bridge
 
 if [ -n "$OLD_IMAGE" ]; then
   # Compose reads PROWLARR_IMAGE from .env, so pinning it here is the rollback.

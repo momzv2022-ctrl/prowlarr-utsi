@@ -204,6 +204,14 @@ at a time, with a perfectly healthy server.
 A server with a public IP, running a Linux Docker supports, and root. Debian and
 Ubuntu are what this is tested on. Docker gets installed if it is missing.
 
+Two things it will not do to your server. It **does not turn on a firewall** —
+if `ufw` is already active it adds rules for 80 and 443, and otherwise it leaves
+it alone and says so, because enabling ufw with only those ports open would cut
+off SSH on any box whose sshd is not on port 22. And a daily timer runs
+`update.sh` as root, so `install.sh` **takes ownership of this directory** if it
+belongs to an ordinary user — otherwise that user could rewrite what root is
+about to run. Use `sudo git pull` here afterwards.
+
 ## Built from
 
 - [Prowlarr](https://github.com/Prowlarr/Prowlarr) — the indexer manager
